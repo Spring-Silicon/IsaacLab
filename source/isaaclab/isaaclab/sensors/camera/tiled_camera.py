@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import carb
+import omni.kit.app
 import warp as wp
 from isaacsim.core.prims import XFormPrim
 from isaacsim.core.version import get_version
@@ -131,6 +132,10 @@ class TiledCamera(Camera):
                 f"TiledCamera is only available from Isaac Sim 4.2.0. Current version is {isaac_sim_version}. Please"
                 " update to Isaac Sim 4.2.0"
             )
+        # render product update state (see :meth:`set_render_product_enabled`)
+        self._render_product_enabled = True
+        self._enabled_at_update: int | None = None
+        self._skip_eager_read = False
         super().__init__(cfg)
 
     def __del__(self):
@@ -172,6 +177,56 @@ class TiledCamera(Camera):
             env_ids = slice(None)
         # reset the frame count
         self._frame[env_ids] = 0
+
+    @property
+    def render_product_enabled(self) -> bool:
+        """Whether the renderer updates this camera's render product on each render (default True)."""
+        return self._render_product_enabled
+
+    def set_render_product_enabled(self, enabled: bool):
+        """Enable or disable the renderer updates of this camera's render product.
+
+        A disabled render product is not rendered, which saves its render time while the other render products
+        of the stage still render. It also has no frame while it is disabled: until it is enabled again and a
+        render (Kit app update) runs, reading the image data raises :class:`RuntimeError` instead of returning an
+        earlier frame. RTX real-time rendering keeps per-render-product temporal history, so the first frames
+        after enabling differ slightly from the frames of a render product that updated on every render.
+
+        Args:
+            enabled: Whether to update the render product on renders.
+
+        Raises:
+            RuntimeError: If the camera is not initialized.
+        """
+        if not self._is_initialized:
+            raise RuntimeError(f"Camera '{self.cfg.prim_path}' is not initialized: it has no render product yet.")
+        enabled = bool(enabled)
+        if enabled == self._render_product_enabled:
+            return
+        self._render_product.hydra_texture.set_updates_enabled(enabled)
+        self._render_product_enabled = enabled
+        if not enabled:
+            # The data read for an earlier step is outdated now: reads raise until a frame exists again.
+            self._outdated_hint = True
+        # Kit update after which a frame rendered with updates enabled exists (None: one exists already).
+        self._enabled_at_update = omni.kit.app.get_app().get_update_number() if enabled else None
+
+    def update(self, dt: float, force_recompute: bool = False):
+        if self._frame_available():
+            super().update(dt, force_recompute)
+            return
+        # No frame for this step: advance the timestamps, but skip the eager reads (forced, history or
+        # visualization). The data stays outdated, so a later read of `data` raises until a frame exists.
+        self._skip_eager_read = True
+        try:
+            super().update(dt, False)
+        finally:
+            self._skip_eager_read = False
+
+    def _update_outdated_buffers(self):
+        if self._skip_eager_read:
+            return
+        super()._update_outdated_buffers()
 
     """
     Implementation.
@@ -229,6 +284,9 @@ class TiledCamera(Camera):
             cameras=self._view.prim_paths, tile_resolution=(self.cfg.width, self.cfg.height)
         )
         self._render_product_paths = [rp.path]
+        self._render_product = rp
+        self._render_product_enabled = True
+        self._enabled_at_update = None
 
         # RTX renders on the GPU even when the simulation device is the CPU. Annotators therefore always
         # deliver CUDA buffers (texture -> device buffer); CPU-device outputs are filled from device staging
@@ -281,6 +339,24 @@ class TiledCamera(Camera):
         self._create_buffers()
 
     def _update_buffers_impl(self, env_ids: Sequence[int]):
+        if not self._frame_available():
+            raise RuntimeError(
+                f"Camera '{self.cfg.prim_path}' has no frame for this step: its render product is disabled, or no"
+                " render ran since it was enabled (see set_render_product_enabled)."
+            )
+        self._read_annotators(env_ids)
+
+    def _frame_available(self) -> bool:
+        """Whether the annotators hold a frame rendered while the render product was enabled."""
+        if not self._render_product_enabled:
+            return False
+        if self._enabled_at_update is not None:
+            if omni.kit.app.get_app().get_update_number() <= self._enabled_at_update:
+                return False
+            self._enabled_at_update = None
+        return True
+
+    def _read_annotators(self, env_ids: Sequence[int]):
         # Increment frame count
         self._frame[env_ids] += 1
 

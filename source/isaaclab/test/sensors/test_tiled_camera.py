@@ -165,6 +165,38 @@ def test_single_camera_init(setup_camera):
     del camera
 
 
+def test_render_product_disabled_has_no_frame(setup_camera):
+    """A disabled render product, or one enabled again without a render since, raises instead of a stale image."""
+    sim, camera_cfg, dt = setup_camera
+    camera = TiledCamera(camera_cfg)
+    sim.reset()
+    for _ in range(5):
+        sim.step()
+    camera.update(dt)
+    assert camera.render_product_enabled
+    assert camera.data.output["rgb"].float().mean() > 0.0
+
+    camera.set_render_product_enabled(False)
+    assert not camera.render_product_enabled
+    with pytest.raises(RuntimeError, match="has no frame"):
+        camera.data
+    sim.step()
+    camera.update(dt)
+    with pytest.raises(RuntimeError, match="has no frame"):
+        camera.data
+    # Eager updates skip the read instead of raising.
+    camera.update(dt, force_recompute=True)
+
+    camera.set_render_product_enabled(True)
+    with pytest.raises(RuntimeError, match="has no frame"):
+        camera.data
+    sim.step()
+    camera.update(dt)
+    assert camera.data.output["rgb"].float().mean() > 0.0
+    assert camera.data.output["distance_to_camera"].mean() > 0.0
+    del camera
+
+
 def test_depth_clipping_max(setup_camera):
     """Test depth max clipping."""
     sim, _, dt = setup_camera
