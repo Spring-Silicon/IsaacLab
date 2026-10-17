@@ -10,7 +10,7 @@ import gymnasium as gym
 import math
 import numpy as np
 import torch
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any, ClassVar
 
 from isaacsim.core.version import get_version
@@ -152,7 +152,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
     """
 
     def step(
-        self, action: torch.Tensor, *, render: bool = True, camera_observations: bool = True
+        self, action: torch.Tensor, *, render: bool = True, camera_observations: bool | Collection[str] = True
     ) -> VecEnvStepReturn:
         """Execute one time-step of the environment's dynamics and reset terminated environments.
 
@@ -173,7 +173,9 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
           (:attr:`ObservationManager.camera_groups`). They are returned as
           :class:`~isaaclab.managers.UnrenderedObservationGroup`, which raises on any term access, so no
           camera data from an earlier render is ever returned for this step, and the observation terms do not
-          read the camera buffers back.
+          read the camera buffers back. A collection of group names computes only those camera groups and
+          skips the others, for example when only some camera render products are updated this step (see
+          :meth:`~isaaclab.sensors.TiledCamera.set_render_product_enabled`).
         * ``render=False`` additionally skips rendering (including the re-render after resets) for this step.
 
         Physics, scene updates, terminations, rewards, recorders, resets and all other observation groups are
@@ -182,8 +184,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         Args:
             action: The actions to apply on the environment. Shape is (num_envs, action_dim).
             render: Whether to render during this step. Defaults to True.
-            camera_observations: Whether to compute the camera observation groups. Requires ``render``.
-                Defaults to True.
+            camera_observations: Whether to compute the camera observation groups (bool), or the names of the
+                camera groups to compute. Computing any camera group requires ``render``. Defaults to True.
 
         Returns:
             A tuple containing the observations, rewards, resets (terminated and truncated) and extras.
@@ -191,9 +193,18 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         Raises:
             ValueError: If camera observations are requested without rendering.
         """
-        if camera_observations and not render:
+        if isinstance(camera_observations, bool):
+            skip_groups = () if camera_observations else self.observation_manager.camera_groups
+            computes_camera_groups = camera_observations
+        else:
+            camera_groups = self.observation_manager.camera_groups
+            unknown = set(camera_observations).difference(camera_groups)
+            if unknown:
+                raise ValueError(f"Not camera observation groups: {sorted(unknown)}. Camera groups: {camera_groups}.")
+            skip_groups = tuple(group for group in camera_groups if group not in camera_observations)
+            computes_camera_groups = len(skip_groups) < len(camera_groups)
+        if computes_camera_groups and not render:
             raise ValueError("Camera observations require rendering the step (render=True).")
-        skip_groups = () if camera_observations else self.observation_manager.camera_groups
 
         # process actions
         self.action_manager.process_action(action.to(self.device))

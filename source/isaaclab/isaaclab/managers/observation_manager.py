@@ -150,8 +150,8 @@ class ObservationManager(ManagerBase):
 
         # Stores the latest observations.
         self._obs_buffer: dict[str, torch.Tensor | dict[str, torch.Tensor]] | None = None
-        # Groups reading camera sensors; resolved on first use of :attr:`camera_groups`.
-        self._camera_groups: tuple[str, ...] | None = None
+        # Camera sensors read by each camera group; resolved on first use of :attr:`camera_group_sensors`.
+        self._camera_groups: dict[str, tuple[str, ...]] | None = None
 
     def __str__(self) -> str:
         """Returns: A string representation for the observation manager."""
@@ -292,20 +292,27 @@ class ObservationManager(ManagerBase):
         of the scene. These groups depend on the rendered frame of the step; they are the groups that
         :meth:`ManagerBasedRLEnv.step` skips when called with ``camera_observations=False``.
         """
+        return tuple(self.camera_group_sensors)
+
+    @property
+    def camera_group_sensors(self) -> dict[str, tuple[str, ...]]:
+        """Camera sensor names read by each camera group (see :attr:`camera_groups`), in term order."""
         if self._camera_groups is None:
             from isaaclab.sensors import Camera
 
             sensors = self._env.scene.sensors
             camera_names = {name for name, sensor in sensors.items() if isinstance(sensor, Camera)}
-            self._camera_groups = tuple(
-                group_name
-                for group_name, term_cfgs in self._group_obs_term_cfgs.items()
-                if any(
-                    isinstance(param, SceneEntityCfg) and param.name in camera_names
+            group_sensors = {}
+            for group_name, term_cfgs in self._group_obs_term_cfgs.items():
+                names = dict.fromkeys(
+                    param.name
                     for term_cfg in term_cfgs
                     for param in term_cfg.params.values()
+                    if isinstance(param, SceneEntityCfg) and param.name in camera_names
                 )
-            )
+                if names:
+                    group_sensors[group_name] = tuple(names)
+            self._camera_groups = group_sensors
         return self._camera_groups
 
     """
