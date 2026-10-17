@@ -197,6 +197,39 @@ def test_render_product_disabled_has_no_frame(setup_camera):
     del camera
 
 
+def test_empty_annotator_output_has_no_frame(setup_camera):
+    """An empty CUDA annotator buffer (null pointer, as after enabling a render product again) raises cleanly.
+
+    The read must not reach the CUDA retile copy, must not count a frame, and must keep the data outdated so
+    that the next read with a delivered frame fills it.
+    """
+    sim, camera_cfg, dt = setup_camera
+    camera = TiledCamera(camera_cfg)
+    sim.reset()
+    for _ in range(5):
+        sim.step()
+    camera.update(dt)
+    assert camera.data.output["rgb"].float().mean() > 0.0
+    frames = camera.frame.clone()
+
+    annotator = camera._annotators["rgba"]
+    empty = wp.empty(0, dtype=wp.uint8, device=camera._annotator_device)
+    assert empty.ptr is None
+    annotator.get_data = lambda *args, **kwargs: empty
+    camera.data.output["rgb"].zero_()
+    sim.step()
+    camera.update(dt)
+    with pytest.raises(RuntimeError, match="returned no data"):
+        camera.data
+    torch.testing.assert_close(camera.frame, frames)
+
+    del annotator.get_data
+    assert camera.data.output["rgb"].float().mean() > 0.0
+    torch.testing.assert_close(camera.frame, frames + 1)
+    del camera
+
+
+
 def test_depth_clipping_max(setup_camera):
     """Test depth max clipping."""
     sim, _, dt = setup_camera

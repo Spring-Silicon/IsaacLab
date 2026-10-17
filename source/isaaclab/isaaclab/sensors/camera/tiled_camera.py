@@ -28,6 +28,15 @@ if TYPE_CHECKING:
     from .tiled_camera_cfg import TiledCameraCfg
 
 
+def _is_empty_buffer(buffer: Any) -> bool:
+    """Whether an annotator output holds no frame (no data, or a Warp array without device memory)."""
+    if buffer is None:
+        return True
+    if isinstance(buffer, wp.array) and buffer.ptr is None:
+        return True
+    return buffer.size == 0
+
+
 def _reshape_tiled_image_cuda(
     tiled_image_buffer: wp.array, batched_image: wp.array, num_tiles_x: int
 ) -> None:
@@ -187,10 +196,11 @@ class TiledCamera(Camera):
         """Enable or disable the renderer updates of this camera's render product.
 
         A disabled render product is not rendered, which saves its render time while the other render products
-        of the stage still render. It also has no frame while it is disabled: until it is enabled again and a
-        render (Kit app update) runs, reading the image data raises :class:`RuntimeError` instead of returning an
-        earlier frame. RTX real-time rendering keeps per-render-product temporal history, so the first frames
-        after enabling differ slightly from the frames of a render product that updated on every render.
+        of the stage still render. It also has no frame while it is disabled: until it is enabled again and the
+        annotators deliver a frame of a later render (Kit app update), reading the image data raises
+        :class:`RuntimeError` instead of returning an earlier frame. The first delivered frame can need more than
+        one render after enabling. RTX real-time rendering keeps per-render-product temporal history, so the first
+        frames after enabling differ slightly from the frames of a render product that updated on every render.
 
         Args:
             enabled: Whether to update the render product on renders.
@@ -344,7 +354,22 @@ class TiledCamera(Camera):
                 f"Camera '{self.cfg.prim_path}' has no frame for this step: its render product is disabled, or no"
                 " render ran since it was enabled (see set_render_product_enabled)."
             )
-        self._read_annotators(env_ids)
+        # Fetch every annotator output before any buffer changes. After a render product is enabled again,
+        # the renderer can need more than one render before the annotators deliver a frame; until then the
+        # outputs are empty (no device pointer). The read raises and the data stays outdated, so the camera
+        # never returns an earlier frame and never copies from a null buffer.
+        outputs = {data_type: annotator.get_data() for data_type, annotator in self._annotators.items()}
+        empty = [
+            data_type
+            for data_type, output in outputs.items()
+            if _is_empty_buffer(output["data"] if isinstance(output, dict) else output)
+        ]
+        if empty:
+            raise RuntimeError(
+                f"Camera '{self.cfg.prim_path}' has no frame for this step: the annotators {empty} returned no"
+                " data (render product enabled again without a delivered frame yet, see set_render_product_enabled)."
+            )
+        self._read_annotators(env_ids, outputs)
 
     def _frame_available(self) -> bool:
         """Whether the annotators hold a frame rendered while the render product was enabled."""
@@ -356,7 +381,7 @@ class TiledCamera(Camera):
             self._enabled_at_update = None
         return True
 
-    def _read_annotators(self, env_ids: Sequence[int]):
+    def _read_annotators(self, env_ids: Sequence[int], outputs: dict):
         # Increment frame count
         self._frame[env_ids] += 1
 
@@ -365,9 +390,8 @@ class TiledCamera(Camera):
             self._update_poses(env_ids)
 
         # Extract the flattened image buffer
-        for data_type, annotator in self._annotators.items():
+        for data_type, output in outputs.items():
             # check whether returned data is a dict (used for segmentation)
-            output = annotator.get_data()
             if isinstance(output, dict):
                 tiled_data_buffer = output["data"]
                 self._data.info[data_type] = output["info"]
