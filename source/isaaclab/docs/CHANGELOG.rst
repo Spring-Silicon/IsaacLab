@@ -1,6 +1,50 @@
 Changelog
 ---------
 
+Unreleased
+~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added :attr:`~isaaclab.sim.PhysxCfg.worker_thread_count` to size the PhysX CPU task dispatcher
+  (``/persistent/physics/numThreads``) for one simulation context. The Kit preference is restored in
+  :meth:`~isaaclab.sim.SimulationContext.clear_instance` instead of being saved on application exit.
+  ``0`` runs all PhysX tasks on the stepping thread, which is fastest for small scenes; the setting
+  only changes task scheduling.
+* Added ``render`` and ``camera_observations`` keyword options to :meth:`~isaaclab.envs.ManagerBasedRLEnv.step`
+  (both default True). ``camera_observations=False`` skips the observation groups that read camera sensors
+  (:attr:`~isaaclab.managers.ObservationManager.camera_groups`) and returns them as
+  :class:`~isaaclab.managers.UnrenderedObservationGroup` placeholders that raise on any term access;
+  ``render=False`` also skips rendering for the step. Physics, other observation groups, recorders and
+  terminations are unchanged. :meth:`~isaaclab.managers.ObservationManager.compute` accepts ``skip_groups``.
+* :class:`~isaaclab.app.AppLauncher` forwards ``limit_cpu_threads`` (from its keyword arguments or the caller's
+  argument parser) to Isaac Sim's ``SimulationApp``, which sizes Kit's carb.tasking and TBB worker pools.
+  Isaac Sim's default of 32 is unchanged when it is not set.
+
+Changed
+^^^^^^^
+
+* CPU-device :class:`~isaaclab.sensors.TiledCamera` sensors read annotators as CUDA buffers (texture to
+  device buffer), unpack the atlas on the GPU and copy each output once into pinned host memory, replacing
+  the replicator texture-to-host copy and host-side atlas unpacking. The host waits on a blocking-sync CUDA
+  event for those copies instead of spinning in a stream synchronization. On this path ``rgb`` is a contiguous
+  buffer holding exactly ``rgba[..., :3]``. Pixel values, camera ordering, dtypes and cadence are unchanged.
+* Disabled ``/physics/updateResidualsToUsd`` in the Isaac Lab experience files, like the other USD
+  writeback outputs. With CPU simulation omni.physx otherwise synchronized USD into Fabric after every
+  physics step even though Isaac Lab does not enable solver residual reporting.
+* :class:`~isaaclab.envs.ManagerBasedRLEnv` computes observations before the post-step recorder
+  callbacks only when needed: a reset happens in the step, interval events are configured, an active
+  recorder term sets :attr:`~isaaclab.managers.RecorderTerm.reads_step_observations` (default True), or
+  :attr:`~isaaclab.managers.ObservationManager.compute_has_side_effects` (noise, modifiers, history or
+  class terms). The returned observations are unchanged. Built-in recorder terms set the flag to False.
+* :class:`~isaaclab.sensors.SensorBase` tracks "all/none outdated" on the host, so sensors with a zero
+  update period refresh without a ``nonzero()`` reduction (a CUDA synchronization) per update or data
+  access. Refreshed values and timestamps are unchanged.
+* :class:`~isaaclab.assets.Articulation` indexes actuator groups on contiguous joint ranges with slices,
+  like the existing all-joints case. Joint commands and torques are unchanged.
+
+
 0.44.9 (2025-07-30)
 ~~~~~~~~~~~~~~~~~~~
 

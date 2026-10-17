@@ -27,6 +27,47 @@ if TYPE_CHECKING:
     from .tiled_camera_cfg import TiledCameraCfg
 
 
+def _reshape_tiled_image_cuda(
+    tiled_image_buffer: wp.array, batched_image: wp.array, num_tiles_x: int
+) -> None:
+    """Copy a CUDA atlas into owned camera storage on the current Warp stream.
+
+    A single tile already has the output layout, so it only needs a device copy.
+    For RGBA atlases, reinterpret each aligned four-byte pixel as one uint32 to
+    use the existing retile kernel with coalesced pixel-sized loads and stores.
+    Neither path aliases the annotator's borrowed storage or changes its lifetime.
+    Other dtypes keep the kernel's element-wise cast semantics.
+    """
+    count, height, width, channels = batched_image.shape
+    source = tiled_image_buffer.flatten()
+    if count == 1 and num_tiles_x == 1 and source.dtype == batched_image.dtype and batched_image.is_contiguous:
+        # Ignore any trailing annotator padding, just as the retile kernel does.
+        wp.copy(batched_image, source, count=batched_image.size)
+        return
+
+    destination = batched_image
+    if (
+        channels == 4
+        and source.dtype == wp.uint8
+        and destination.dtype == wp.uint8
+        and destination.is_contiguous
+        and source.ptr % 4 == 0
+        and destination.ptr % 4 == 0
+    ):
+        source = wp.array(ptr=source.ptr, shape=(source.size // 4,), dtype=wp.uint32, device=source.device)
+        destination = wp.array(
+            ptr=destination.ptr, shape=(count, height, width, 1), dtype=wp.uint32, device=destination.device
+        )
+        channels = 1
+
+    wp.launch(
+        kernel=reshape_tiled_image,
+        dim=(count, height, width),
+        inputs=[source, destination, height, width, channels, num_tiles_x],
+        device=batched_image.device,
+    )
+
+
 class TiledCamera(Camera):
     r"""The tiled rendering based camera sensor for acquiring the same data as the Camera class.
 
@@ -189,16 +230,27 @@ class TiledCamera(Camera):
         )
         self._render_product_paths = [rp.path]
 
+        # RTX renders on the GPU even when the simulation device is the CPU. Annotators therefore always
+        # deliver CUDA buffers (texture -> device buffer); CPU-device outputs are filled from device staging
+        # buffers with one device-to-host copy each (see :meth:`_create_buffers`), instead of replicator's
+        # direct texture -> host-buffer copy and a host-side retile.
+        if self.device == "cpu":
+            self._annotator_device = f"cuda:{carb_settings_iface.get('/renderer/activeGpu') or 0}"
+        else:
+            self._annotator_device = self.device
+
         # Define the annotators based on requested data types
         self._annotators = dict()
         for annotator_type in self.cfg.data_types:
             if annotator_type == "rgba" or annotator_type == "rgb":
-                annotator = rep.AnnotatorRegistry.get_annotator("rgb", device=self.device, do_array_copy=False)
+                annotator = rep.AnnotatorRegistry.get_annotator(
+                    "rgb", device=self._annotator_device, do_array_copy=False
+                )
                 self._annotators["rgba"] = annotator
             elif annotator_type == "depth" or annotator_type == "distance_to_image_plane":
                 # keep depth for backwards compatibility
                 annotator = rep.AnnotatorRegistry.get_annotator(
-                    "distance_to_image_plane", device=self.device, do_array_copy=False
+                    "distance_to_image_plane", device=self._annotator_device, do_array_copy=False
                 )
                 self._annotators[annotator_type] = annotator
             # note: we are verbose here to make it easier to understand the code.
@@ -217,7 +269,7 @@ class TiledCamera(Camera):
                     init_params = {"colorize": self.cfg.colorize_instance_id_segmentation}
 
                 annotator = rep.AnnotatorRegistry.get_annotator(
-                    annotator_type, init_params, device=self.device, do_array_copy=False
+                    annotator_type, init_params, device=self._annotator_device, do_array_copy=False
                 )
                 self._annotators[annotator_type] = annotator
 
@@ -246,11 +298,11 @@ class TiledCamera(Camera):
             else:
                 tiled_data_buffer = output
 
-            # convert data buffer to warp array
+            # Annotators deliver CUDA buffers (see `_initialize_impl`). Keep them on the annotator device.
             if isinstance(tiled_data_buffer, np.ndarray):
-                tiled_data_buffer = wp.array(tiled_data_buffer, device=self.device, dtype=wp.uint8)
+                tiled_data_buffer = wp.array(tiled_data_buffer, device=self._annotator_device, dtype=wp.uint8)
             else:
-                tiled_data_buffer = tiled_data_buffer.to(device=self.device)
+                tiled_data_buffer = tiled_data_buffer.to(device=self._annotator_device)
 
             # process data for different segmentation types
             # Note: Replicator returns raw buffers of dtype uint32 for segmentation types
@@ -261,7 +313,10 @@ class TiledCamera(Camera):
                 or (data_type == "instance_id_segmentation_fast" and self.cfg.colorize_instance_id_segmentation)
             ):
                 tiled_data_buffer = wp.array(
-                    ptr=tiled_data_buffer.ptr, shape=(*tiled_data_buffer.shape, 4), dtype=wp.uint8, device=self.device
+                    ptr=tiled_data_buffer.ptr,
+                    shape=(*tiled_data_buffer.shape, 4),
+                    dtype=wp.uint8,
+                    device=self._annotator_device,
                 )
 
             # For motion vectors, we only require the first two channels of the tiled buffer
@@ -269,21 +324,15 @@ class TiledCamera(Camera):
             if data_type == "motion_vectors":
                 tiled_data_buffer = tiled_data_buffer[:, :, :2].contiguous()
 
-            wp.launch(
-                kernel=reshape_tiled_image,
-                dim=(self._view.count, self.cfg.height, self.cfg.width),
-                inputs=[
-                    tiled_data_buffer.flatten(),
-                    wp.from_torch(self._data.output[data_type]),  # zero-copy alias
-                    *list(self._data.output[data_type].shape[1:]),  # height, width, num_channels
-                    self._tiling_grid_shape()[0],  # num_tiles_x
-                ],
-                device=self.device,
-            )
-
-            # alias rgb as first 3 channels of rgba
-            if data_type == "rgba" and "rgb" in self.cfg.data_types:
-                self._data.output["rgb"] = self._data.output["rgba"][..., :3]
+            if self._host_staging is None:
+                _reshape_tiled_image_cuda(
+                    tiled_data_buffer, wp.from_torch(self._data.output[data_type]), self._tiling_grid_shape()[0]
+                )
+                # alias rgb as first 3 channels of rgba
+                if data_type == "rgba" and "rgb" in self.cfg.data_types:
+                    self._data.output["rgb"] = self._data.output["rgba"][..., :3]
+            else:
+                self._read_back_to_host(data_type, tiled_data_buffer)
 
             # NOTE: The `distance_to_camera` annotator returns the distance to the camera optical center. However,
             #       the replicator depth clipping is applied w.r.t. to the image plane which may result in values
@@ -393,8 +442,46 @@ class TiledCamera(Camera):
                     (self._view.count, self.cfg.height, self.cfg.width, 1), device=self.device, dtype=torch.int32
                 ).contiguous()
 
+        # CPU-device outputs are filled from same-shaped device staging buffers (one retile on the GPU,
+        # then one asynchronous device-to-host copy per output into pinned memory). On this path "rgb"
+        # is a separate contiguous buffer holding exactly RGBA[..., :3], compacted on the GPU, so
+        # consumers that copy RGB do not pay a strided host copy.
+        self._host_staging = None
+        if self._annotator_device != self.device:
+            self._host_staging = dict()
+            for name, value in data_dict.items():
+                if name != "rgb":
+                    self._host_staging[name] = torch.empty_like(value, device=self._annotator_device)
+                    data_dict[name] = value.pin_memory()
+            if "rgb" in data_dict:
+                rgb_shape = (self._view.count, self.cfg.height, self.cfg.width, 3)
+                self._host_staging["rgb"] = torch.empty(rgb_shape, device=self._annotator_device, dtype=torch.uint8)
+                data_dict["rgb"] = torch.zeros(rgb_shape, dtype=torch.uint8).pin_memory()
+            # Wait for the copies with a blocking-sync event: the thread sleeps until the GPU signals
+            # completion instead of spin-waiting a core (CUDA's default may spin), same completion point.
+            self._readback_done = torch.cuda.Event(blocking=True)
+
         self._data.output = data_dict
         self._data.info = dict()
+
+    def _read_back_to_host(self, data_type: str, tiled_data_buffer: wp.array):
+        """Unpack a CUDA atlas into device staging and copy it into the pinned CPU output.
+
+        Everything is ordered on the current torch stream of the annotator device; the method returns only
+        after the host buffers are complete, so CPU consumers observe this frame's data.
+        """
+        staging = self._host_staging[data_type]
+        stream = torch.cuda.current_stream(staging.device)
+        with wp.ScopedStream(wp.stream_from_torch(stream)):
+            _reshape_tiled_image_cuda(tiled_data_buffer, wp.from_torch(staging), self._tiling_grid_shape()[0])
+        with torch.cuda.stream(stream):
+            self._data.output[data_type].copy_(staging, non_blocking=True)
+            if data_type == "rgba" and "rgb" in self._host_staging:
+                rgb = self._host_staging["rgb"]
+                rgb.copy_(staging[..., :3])
+                self._data.output["rgb"].copy_(rgb, non_blocking=True)
+            self._readback_done.record(stream)
+        self._readback_done.synchronize()
 
     def _tiled_image_shape(self) -> tuple[int, int]:
         """Returns a tuple containing the dimension of the tiled image."""

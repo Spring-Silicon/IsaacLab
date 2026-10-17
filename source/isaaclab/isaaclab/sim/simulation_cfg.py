@@ -160,6 +160,17 @@ class PhysxCfg:
     gpu_max_particle_contacts: int = 2**20
     """Size of particle contacts stream buffer allocated in pinned host memory. Default is 2 ** 20."""
 
+    worker_thread_count: int | None = None
+    """Number of worker threads of the PhysX CPU task dispatcher. Defaults to None, in which case the Kit
+    preference ``/persistent/physics/numThreads`` is kept (8 unless overridden).
+
+    The dispatcher executes the CPU part of PhysX: the complete pipeline for CPU simulation and the host-side
+    tasks (including the stepping task itself) for GPU simulation. A value of 0 runs every PhysX task on the
+    thread that steps the simulation, which removes worker hand-offs and is fastest for small scenes. The
+    value only changes scheduling, not the simulation result. It is read when the physics scene is created
+    and applies to the simulation context only: the Kit preference is restored when the context is cleared.
+    """
+
 
 @configclass
 class RenderCfg:

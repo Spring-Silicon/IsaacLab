@@ -243,6 +243,8 @@ class SimulationContext(_SimulationContext):
         else:
             self._app_control_on_stop_handle = None
         self._disable_app_control_on_stop_handle = False
+        # Kit preference value replaced by PhysxCfg.worker_thread_count (restored in clear_instance)
+        self._saved_physx_num_threads: int | None = None
 
         # flatten out the simulation dictionary
         sim_params = self.cfg.to_dict()
@@ -250,6 +252,13 @@ class SimulationContext(_SimulationContext):
             if "physx" in sim_params:
                 physx_params = sim_params.pop("physx")
                 sim_params.update(physx_params)
+            # the PhysX CPU dispatcher size is a persistent Kit preference that omni.physx reads when it creates the
+            # physics scene. Apply it for the lifetime of this context only (Kit saves /persistent/* on exit), so it is
+            # not forwarded to Isaac Sim, which would write it permanently.
+            worker_thread_count = sim_params.pop("worker_thread_count", None)
+            if worker_thread_count is not None:
+                self._saved_physx_num_threads = self.carb_settings.get("/persistent/physics/numThreads")
+                self.carb_settings.set_int("/persistent/physics/numThreads", worker_thread_count)
 
         # add warning about enabling stabilization for large step sizes
         if not self.cfg.physx.enable_stabilization and (self.cfg.dt > 0.0333):
@@ -732,6 +741,12 @@ class SimulationContext(_SimulationContext):
             if cls._instance._app_control_on_stop_handle is not None:
                 cls._instance._app_control_on_stop_handle.unsubscribe()
                 cls._instance._app_control_on_stop_handle = None
+            # restore the user's PhysX dispatcher preference replaced by PhysxCfg.worker_thread_count
+            if cls._instance._saved_physx_num_threads is not None:
+                cls._instance.carb_settings.set_int(
+                    "/persistent/physics/numThreads", cls._instance._saved_physx_num_threads
+                )
+                cls._instance._saved_physx_num_threads = None
         # call parent to clear the instance
         super().clear_instance()
 

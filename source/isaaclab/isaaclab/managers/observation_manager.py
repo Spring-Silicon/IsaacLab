@@ -10,7 +10,7 @@ from __future__ import annotations
 import inspect
 import numpy as np
 import torch
-from collections.abc import Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from prettytable import PrettyTable
 from typing import TYPE_CHECKING
 
@@ -19,9 +19,47 @@ from isaaclab.utils.buffers import CircularBuffer
 
 from .manager_base import ManagerBase, ManagerTermBase
 from .manager_term_cfg import ObservationGroupCfg, ObservationTermCfg
+from .scene_entity_cfg import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+class UnrenderedObservationGroup(Mapping):
+    """Stand-in for an observation group whose cameras were not rendered for this step.
+
+    :meth:`ObservationManager.compute` returns it for groups listed in ``skip_groups``. The term names stay
+    visible (membership, iteration, :func:`len`), but reading any term of the group raises :class:`RuntimeError`,
+    so an image from an earlier render can never be consumed in place of the current one. Looking up a name
+    that is not a term of the group raises :class:`KeyError` as for a regular dictionary.
+    """
+
+    unrendered = True
+    """Marker for consumers that check for skipped observation groups without importing this class."""
+
+    def __init__(self, group_name: str, term_names: Sequence[str]):
+        self._group_name = group_name
+        self._term_names = tuple(term_names)
+
+    def __getitem__(self, key):
+        if key in self._term_names:
+            raise RuntimeError(
+                f"Observation '{self._group_name}/{key}' is unavailable: its cameras were not rendered for this"
+                " control step. Only steps that render camera observations provide this group."
+            )
+        raise KeyError(key)
+
+    def __contains__(self, key) -> bool:
+        return key in self._term_names
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._term_names)
+
+    def __len__(self) -> int:
+        return len(self._term_names)
+
+    def __repr__(self) -> str:
+        return f"UnrenderedObservationGroup({self._group_name!r}, terms={list(self._term_names)})"
 
 
 class ObservationManager(ManagerBase):
@@ -112,6 +150,8 @@ class ObservationManager(ManagerBase):
 
         # Stores the latest observations.
         self._obs_buffer: dict[str, torch.Tensor | dict[str, torch.Tensor]] | None = None
+        # Groups reading camera sensors; resolved on first use of :attr:`camera_groups`.
+        self._camera_groups: tuple[str, ...] | None = None
 
     def __str__(self) -> str:
         """Returns: A string representation for the observation manager."""
@@ -225,6 +265,49 @@ class ObservationManager(ManagerBase):
         """
         return self._group_obs_concatenate
 
+    @property
+    def compute_has_side_effects(self) -> bool:
+        """Whether an additional :meth:`compute` call could differ from not making it.
+
+        Conservatively True if any term samples noise (random number state), uses modifiers, keeps
+        history, or is a class-based term: these may carry or consume state across calls. Only
+        groups of plain function terms, which by contract read the environment, report False.
+        """
+        if self._group_obs_class_instances:
+            return True
+        return any(
+            term_cfg.noise is not None
+            or term_cfg.modifiers
+            or term_cfg.history_length > 0
+            or isinstance(term_cfg.func, ManagerTermBase)
+            for term_cfgs in self._group_obs_term_cfgs.values()
+            for term_cfg in term_cfgs
+        )
+
+    @property
+    def camera_groups(self) -> tuple[str, ...]:
+        """Names of the groups with a term that reads a camera sensor (:class:`~isaaclab.sensors.Camera`).
+
+        A term reads a camera if one of its parameters is a :class:`SceneEntityCfg` naming a camera sensor
+        of the scene. These groups depend on the rendered frame of the step; they are the groups that
+        :meth:`ManagerBasedRLEnv.step` skips when called with ``camera_observations=False``.
+        """
+        if self._camera_groups is None:
+            from isaaclab.sensors import Camera
+
+            sensors = self._env.scene.sensors
+            camera_names = {name for name, sensor in sensors.items() if isinstance(sensor, Camera)}
+            self._camera_groups = tuple(
+                group_name
+                for group_name, term_cfgs in self._group_obs_term_cfgs.items()
+                if any(
+                    isinstance(param, SceneEntityCfg) and param.name in camera_names
+                    for term_cfg in term_cfgs
+                    for param in term_cfg.params.values()
+                )
+            )
+        return self._camera_groups
+
     """
     Operations.
     """
@@ -245,7 +328,9 @@ class ObservationManager(ManagerBase):
         # nothing to log here
         return {}
 
-    def compute(self, update_history: bool = False) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    def compute(
+        self, update_history: bool = False, skip_groups: Collection[str] = ()
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor] | UnrenderedObservationGroup]:
         """Compute the observations per group for all groups.
 
         The method computes the observations for all the groups handled by the observation manager.
@@ -255,22 +340,46 @@ class ObservationManager(ManagerBase):
             update_history: The boolean indicator without return obs should be appended to observation history.
                 Default to False, in which case calling compute_group does not modify history. This input is no-ops
                 if the group's history_length == 0.
+            skip_groups: Groups that are not computed. Each is returned as an :class:`UnrenderedObservationGroup`,
+                which raises on any term access. Only groups of stateless terms (no noise, modifiers, history,
+                or class-based terms) can be skipped, since skipping must not change any later observation.
 
         Returns:
             A dictionary with keys as the group names and values as the computed observations.
             The observations are either concatenated into a single tensor or returned as a dictionary
             with keys corresponding to the term's name.
+
+        Raises:
+            ValueError: If a group in ``skip_groups`` keeps state across computations.
         """
         # create a buffer for storing obs from all the groups
         obs_buffer = dict()
         # iterate over all the terms in each group
         for group_name in self._group_obs_term_names:
-            obs_buffer[group_name] = self.compute_group(group_name, update_history=update_history)
+            if group_name in skip_groups:
+                obs_buffer[group_name] = self._unrendered_group(group_name)
+            else:
+                obs_buffer[group_name] = self.compute_group(group_name, update_history=update_history)
         # otherwise return a dict with observations of all groups
 
         # Cache the observations.
         self._obs_buffer = obs_buffer
         return obs_buffer
+
+    def _unrendered_group(self, group_name: str) -> UnrenderedObservationGroup:
+        """Placeholder for a skipped group; rejects groups whose terms carry or consume state."""
+        for term_name, term_cfg in zip(self._group_obs_term_names[group_name], self._group_obs_term_cfgs[group_name]):
+            if (
+                term_cfg.noise is not None
+                or term_cfg.modifiers
+                or term_cfg.history_length > 0
+                or isinstance(term_cfg.func, ManagerTermBase)
+            ):
+                raise ValueError(
+                    f"Observation group '{group_name}' cannot be skipped: term '{term_name}' uses noise, modifiers,"
+                    " history or a class-based term, so skipping it would change later observations."
+                )
+        return UnrenderedObservationGroup(group_name, self._group_obs_term_names[group_name])
 
     def compute_group(self, group_name: str, update_history: bool = False) -> torch.Tensor | dict[str, torch.Tensor]:
         """Computes the observations for a given group.

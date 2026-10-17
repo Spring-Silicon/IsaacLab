@@ -1640,6 +1640,8 @@ class Articulation(AssetBase):
         """Process and apply articulation joint properties."""
         # create actuators
         self.actuators = dict()
+        # actuator name -> slice for actuators acting on a contiguous, ascending range of joints
+        self._actuator_joint_slices: dict[str, slice] = dict()
         # flag for implicit actuators
         # if this is false, we by-pass certain checks when doing actuator-related operations
         self._has_implicit_actuators = False
@@ -1687,6 +1689,11 @@ class Articulation(AssetBase):
             )
             # store actuator group
             self.actuators[actuator_name] = actuator
+            # an ascending run of joint indices is equivalent to a slice
+            if isinstance(joint_ids, torch.Tensor) and len(joint_ids) > 0:
+                first, last = int(joint_ids[0]), int(joint_ids[-1])
+                if torch.equal(joint_ids.cpu(), torch.arange(first, last + 1)):
+                    self._actuator_joint_slices[actuator_name] = slice(first, last + 1)
             # set the passed gains and limits into the simulation
             if isinstance(actuator, ImplicitActuator):
                 self._has_implicit_actuators = True
@@ -1805,37 +1812,39 @@ class Articulation(AssetBase):
         the actuator models compute the joint level simulation commands and sets them into the PhysX buffers.
         """
         # process actions per group
-        for actuator in self.actuators.values():
+        for name, actuator in self.actuators.items():
+            # contiguous joint groups are indexed with slices: views instead of gathers, as for slice(None)
+            joint_ids = self._actuator_joint_slices.get(name, actuator.joint_indices)
             # prepare input for actuator model based on cached data
             # TODO : A tensor dict would be nice to do the indexing of all tensors together
             control_action = ArticulationActions(
-                joint_positions=self._data.joint_pos_target[:, actuator.joint_indices],
-                joint_velocities=self._data.joint_vel_target[:, actuator.joint_indices],
-                joint_efforts=self._data.joint_effort_target[:, actuator.joint_indices],
+                joint_positions=self._data.joint_pos_target[:, joint_ids],
+                joint_velocities=self._data.joint_vel_target[:, joint_ids],
+                joint_efforts=self._data.joint_effort_target[:, joint_ids],
                 joint_indices=actuator.joint_indices,
             )
             # compute joint command from the actuator model
             control_action = actuator.compute(
                 control_action,
-                joint_pos=self._data.joint_pos[:, actuator.joint_indices],
-                joint_vel=self._data.joint_vel[:, actuator.joint_indices],
+                joint_pos=self._data.joint_pos[:, joint_ids],
+                joint_vel=self._data.joint_vel[:, joint_ids],
             )
             # update targets (these are set into the simulation)
             if control_action.joint_positions is not None:
-                self._joint_pos_target_sim[:, actuator.joint_indices] = control_action.joint_positions
+                self._joint_pos_target_sim[:, joint_ids] = control_action.joint_positions
             if control_action.joint_velocities is not None:
-                self._joint_vel_target_sim[:, actuator.joint_indices] = control_action.joint_velocities
+                self._joint_vel_target_sim[:, joint_ids] = control_action.joint_velocities
             if control_action.joint_efforts is not None:
-                self._joint_effort_target_sim[:, actuator.joint_indices] = control_action.joint_efforts
+                self._joint_effort_target_sim[:, joint_ids] = control_action.joint_efforts
             # update state of the actuator model
             # -- torques
-            self._data.computed_torque[:, actuator.joint_indices] = actuator.computed_effort
-            self._data.applied_torque[:, actuator.joint_indices] = actuator.applied_effort
+            self._data.computed_torque[:, joint_ids] = actuator.computed_effort
+            self._data.applied_torque[:, joint_ids] = actuator.applied_effort
             # -- actuator data
-            self._data.soft_joint_vel_limits[:, actuator.joint_indices] = actuator.velocity_limit
+            self._data.soft_joint_vel_limits[:, joint_ids] = actuator.velocity_limit
             # TODO: find a cleaner way to handle gear ratio. Only needed for variable gear ratio actuators.
             if hasattr(actuator, "gear_ratio"):
-                self._data.gear_ratio[:, actuator.joint_indices] = actuator.gear_ratio
+                self._data.gear_ratio[:, joint_ids] = actuator.gear_ratio
 
     """
     Internal helpers -- Debugging.

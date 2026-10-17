@@ -178,12 +178,22 @@ class SensorBase(ABC):
         self._timestamp[env_ids] = 0.0
         self._timestamp_last_update[env_ids] = 0.0
         # Set all reset sensors to outdated so that they are updated when data is called the next time.
-        self._is_outdated[env_ids] = True
+        if isinstance(env_ids, slice) and env_ids == slice(None):
+            self._outdated_hint = True
+        elif self._outdated_hint is not True:
+            self._materialize_outdated()
+            self._is_outdated[env_ids] = True
 
     def update(self, dt: float, force_recompute: bool = False):
         # Update the timestamp for the sensors
         self._timestamp += dt
-        self._is_outdated |= self._timestamp - self._timestamp_last_update + 1e-6 >= self.cfg.update_period
+        if self.cfg.update_period <= 0.0:
+            # The timestamp never falls behind its last update, so every sensor is outdated
+            # after any update. Record that on the host instead of evaluating the condition.
+            self._outdated_hint = True
+        elif self._outdated_hint is not True:
+            self._materialize_outdated()
+            self._is_outdated |= self._timestamp - self._timestamp_last_update + 1e-6 >= self.cfg.update_period
         # Update the buffers
         # TODO (from @mayank): Why is there a history length here when it doesn't mean anything in the sensor base?!?
         #   It is only for the contact sensor but there we should redefine the update function IMO.
@@ -211,6 +221,11 @@ class SensorBase(ABC):
         self._num_envs = len(self._parent_prims)
         # Boolean tensor indicating whether the sensor data has to be refreshed
         self._is_outdated = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
+        # Host summary of ``_is_outdated``: True (all outdated) or False (none outdated) while the
+        # device mask is stale; None when the device mask is authoritative. It lets the common
+        # all/none cases skip device reductions and the host synchronization of ``nonzero()``.
+        self._outdated_hint: bool | None = True
+        self._all_env_ids = torch.arange(self._num_envs, dtype=torch.long, device=self._device)
         # Current timestamp (in seconds)
         self._timestamp = torch.zeros(self._num_envs, device=self._device)
         # Timestamp from last update
@@ -345,8 +360,22 @@ class SensorBase(ABC):
     Helper functions.
     """
 
+    def _materialize_outdated(self):
+        """Make the device mask ``_is_outdated`` authoritative again."""
+        if self._outdated_hint is not None:
+            self._is_outdated.fill_(self._outdated_hint)
+            self._outdated_hint = None
+
     def _update_outdated_buffers(self):
         """Fills the sensor data for the outdated sensors."""
+        if self._outdated_hint is False:
+            return
+        if self._outdated_hint is True:
+            # every sensor is outdated: same refresh as the mask path, without the reduction
+            self._update_buffers_impl(self._all_env_ids)
+            self._timestamp_last_update.copy_(self._timestamp)
+            self._outdated_hint = False
+            return
         outdated_env_ids = self._is_outdated.nonzero().squeeze(-1)
         if len(outdated_env_ids) > 0:
             # obtain new data
@@ -355,3 +384,4 @@ class SensorBase(ABC):
             self._timestamp_last_update[outdated_env_ids] = self._timestamp[outdated_env_ids]
             # set outdated flag to false for the updated sensors
             self._is_outdated[outdated_env_ids] = False
+        self._outdated_hint = False

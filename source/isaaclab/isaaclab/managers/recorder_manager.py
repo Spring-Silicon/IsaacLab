@@ -64,6 +64,15 @@ class RecorderTerm(ManagerTermBase):
     * Post-step recording: This callback is invoked at the end of `env.step()` when all the managers are processed.
     """
 
+    reads_step_observations: bool = True
+    """Whether the post-step or reset callbacks read ``env.obs_buf``.
+
+    :class:`~isaaclab.envs.ManagerBasedRLEnv` refreshes ``env.obs_buf`` before these callbacks when any
+    active term sets this flag. Terms that record simulator state, actions or task data rather than
+    observations should set it to False so that the step does not compute observations an extra time.
+    Pre-step callbacks always see the observations returned by the previous step.
+    """
+
     def __init__(self, cfg: RecorderTermCfg, env: ManagerBasedEnv):
         """Initialize the recorder term.
 
@@ -211,6 +220,11 @@ class RecorderManager(ManagerBase):
     def active_terms(self) -> list[str]:
         """Name of active recorder terms."""
         return self._term_names
+
+    @property
+    def reads_step_observations(self) -> bool:
+        """Whether any active term reads ``env.obs_buf`` in its post-step or reset callbacks."""
+        return any(term.reads_step_observations for term in self._terms.values())
 
     @property
     def exported_successful_episode_count(self, env_id=None) -> int:

@@ -18,7 +18,7 @@ import isaacsim.core.utils.prims as prim_utils
 import pytest
 from isaacsim.core.api.simulation_context import SimulationContext as IsaacSimulationContext
 
-from isaaclab.sim import SimulationCfg, SimulationContext
+from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +93,23 @@ def test_carb_setting():
     # unknown carb setting
     sim.set_setting("/myExt/using_omniverse_version", sim.get_version())
     assert tuple(sim.get_setting("/myExt/using_omniverse_version")) == tuple(sim.get_version())
+
+
+def test_physx_worker_thread_count():
+    """Test that the PhysX dispatcher size applies to the simulation context only."""
+    sim = SimulationContext()
+    # unset: the Kit preference is kept
+    preference = sim.get_setting("/persistent/physics/numThreads")
+    assert preference is not None
+    SimulationContext.clear_instance()
+    # set: used while the context exists (omni.physx reads it when reset creates the physics scene), then restored.
+    # The context is not reset here: in Isaac Sim 5.0 a bare context that was reset and stepped makes the next
+    # SimulationContext() in the same process hang while stopping the timeline, with or without this setting.
+    requested = 0 if preference != 0 else 1
+    sim = SimulationContext(SimulationCfg(physx=PhysxCfg(worker_thread_count=requested)))
+    assert sim.get_setting("/persistent/physics/numThreads") == requested
+    SimulationContext.clear_instance()
+    assert sim.get_setting("/persistent/physics/numThreads") == preference
 
 
 def test_headless_mode():

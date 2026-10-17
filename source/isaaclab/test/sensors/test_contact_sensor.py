@@ -369,6 +369,51 @@ def test_no_contact_reporting(setup_simulation):
         assert contact_sensor_2.data.force_matrix_w.sum().item() == 0.0
 
 
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("num_envs", [1, 4])
+def test_lazy_contact_reads_match_per_step_updates(setup_simulation, device, num_envs):
+    """A lazily refreshed sensor reads the same latest contact data as one refreshed after every step.
+
+    The lazy sensor (no history) is queried only every eighth physics step and after resets; the eager
+    sensor on the same body (with history) refreshes after every physics step.
+    """
+    sim_dt, durations, terrains, devices, carb_settings_iface = setup_simulation
+    carb_settings_iface.set_bool("/physics/disableContactProcessing", False)
+    with build_simulation_context(device=device, dt=sim_dt, add_lighting=True) as sim:
+        sim._app_control_on_stop_handle = None
+        scene_cfg = ContactSensorSceneCfg(num_envs=num_envs, env_spacing=1.0, lazy_sensor_update=True)
+        scene_cfg.terrain = FLAT_TERRAIN_CFG.replace(prim_path="/World/ground")
+        scene_cfg.shape = CUBE_CFG.replace(prim_path="{ENV_REGEX_NS}/Cube_1")
+        scene_cfg.shape.init_state.pos = (0, -1.0, 1.0)
+        scene_cfg.shape_2 = CUBE_CFG.replace(prim_path="{ENV_REGEX_NS}/Cube_2")
+        scene_cfg.shape_2.init_state.pos = (0, -1.0, 1.525)
+        sensor_cfg = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Cube_1", update_period=0.0, filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube_2"]
+        )
+        scene_cfg.contact_sensor = sensor_cfg.replace(history_length=0)
+        scene_cfg.contact_sensor_2 = sensor_cfg.replace(history_length=3)
+        scene = InteractiveScene(scene_cfg)
+        sim.reset()
+        lazy, eager = scene["contact_sensor"], scene["contact_sensor_2"]
+        scene.reset()
+        compared_in_contact = 0
+        for step in range(1, 601):
+            _perform_sim_step(sim, scene, sim_dt)
+            if step == 400:
+                # resets clear the data; the next query refreshes from the simulation again
+                scene.reset()
+            if step % 8 == 0 or step == 400:
+                lazy_data, eager_data = lazy.data, eager.data
+                torch.testing.assert_close(lazy_data.net_forces_w, eager_data.net_forces_w, rtol=0, atol=0)
+                torch.testing.assert_close(lazy_data.force_matrix_w, eager_data.force_matrix_w, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    lazy_data.net_forces_w_history[:, 0], eager_data.net_forces_w_history[:, 0], rtol=0, atol=0
+                )
+                compared_in_contact += int(lazy_data.force_matrix_w.abs().sum().item() > 0.0)
+        # contacts happened and were compared
+        assert compared_in_contact > 10
+
+
 def test_sensor_print(setup_simulation):
     """Test sensor print is working correctly."""
     sim_dt, durations, terrains, devices, carb_settings_iface = setup_simulation

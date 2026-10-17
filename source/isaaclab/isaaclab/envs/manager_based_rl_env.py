@@ -151,7 +151,9 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
     Operations - MDP
     """
 
-    def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+    def step(
+        self, action: torch.Tensor, *, render: bool = True, camera_observations: bool = True
+    ) -> VecEnvStepReturn:
         """Execute one time-step of the environment's dynamics and reset terminated environments.
 
         Unlike the :class:`ManagerBasedEnv.step` class, the function performs the following operations:
@@ -164,12 +166,35 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         6. Compute the observations.
         7. Return the observations, rewards, resets and extras.
 
+        By default every step renders (at the configured render interval) and computes all observation groups.
+        Callers that know an observation will not be read can skip that work:
+
+        * ``camera_observations=False`` skips the observation groups that read camera sensors
+          (:attr:`ObservationManager.camera_groups`). They are returned as
+          :class:`~isaaclab.managers.UnrenderedObservationGroup`, which raises on any term access, so no
+          camera data from an earlier render is ever returned for this step, and the observation terms do not
+          read the camera buffers back.
+        * ``render=False`` additionally skips rendering (including the re-render after resets) for this step.
+
+        Physics, scene updates, terminations, rewards, recorders, resets and all other observation groups are
+        unaffected by both options.
+
         Args:
             action: The actions to apply on the environment. Shape is (num_envs, action_dim).
+            render: Whether to render during this step. Defaults to True.
+            camera_observations: Whether to compute the camera observation groups. Requires ``render``.
+                Defaults to True.
 
         Returns:
             A tuple containing the observations, rewards, resets (terminated and truncated) and extras.
+
+        Raises:
+            ValueError: If camera observations are requested without rendering.
         """
+        if camera_observations and not render:
+            raise ValueError("Camera observations require rendering the step (render=True).")
+        skip_groups = () if camera_observations else self.observation_manager.camera_groups
+
         # process actions
         self.action_manager.process_action(action.to(self.device))
 
@@ -177,7 +202,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
 
         # check if we need to do rendering within the physics loop
         # note: checked here once to avoid multiple checks within the loop
-        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        is_rendering = render and (self.sim.has_gui() or self.sim.has_rtx_sensors())
 
         # perform physics stepping
         for _ in range(self.cfg.decimation):
@@ -207,14 +232,25 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         # -- reward computation
         self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
 
+        # -- envs that terminated/timed-out
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        num_reset_envs = len(reset_env_ids)
+
         if len(self.recorder_manager.active_terms) > 0:
-            # update observations for recording if needed
-            self.obs_buf = self.observation_manager.compute()
+            # update observations for recording if needed. Without resets or interval events, the final
+            # observation compute below sees the same simulator and sensor state, so the extra compute is
+            # only needed when a recorder reads it or when computing has side effects (noise, state).
+            if (
+                num_reset_envs > 0
+                or "interval" in self.event_manager.available_modes
+                or self.recorder_manager.reads_step_observations
+                or self.observation_manager.compute_has_side_effects
+            ):
+                self.obs_buf = self.observation_manager.compute(skip_groups=skip_groups)
             self.recorder_manager.record_post_step()
 
         # -- reset envs that terminated/timed-out and log the episode information
-        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-        if len(reset_env_ids) > 0:
+        if num_reset_envs > 0:
             # trigger recorder terms for pre-reset calls
             self.recorder_manager.record_pre_reset(reset_env_ids)
 
@@ -224,7 +260,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
             self.sim.forward()
 
             # if sensors are added to the scene, make sure we render to reflect changes in reset
-            if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
+            if render and self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
                 self.sim.render()
 
             # trigger recorder terms for post-reset calls
@@ -237,7 +273,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
             self.event_manager.apply(mode="interval", dt=self.step_dt)
         # -- compute observations
         # note: done after reset to get the correct observations for reset envs
-        self.obs_buf = self.observation_manager.compute(update_history=True)
+        self.obs_buf = self.observation_manager.compute(update_history=True, skip_groups=skip_groups)
 
         # return observations, rewards, resets and extras
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras

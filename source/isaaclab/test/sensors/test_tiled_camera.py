@@ -24,6 +24,7 @@ import isaacsim.core.utils.prims as prim_utils
 import isaacsim.core.utils.stage as stage_utils
 import omni.replicator.core as rep
 import pytest
+import warp as wp
 from isaacsim.core.prims import SingleGeometryPrim, SingleRigidPrim
 from pxr import Gf, UsdGeom
 
@@ -35,8 +36,54 @@ except ModuleNotFoundError:
 
 import isaaclab.sim as sim_utils
 from isaaclab.sensors.camera import Camera, CameraCfg, TiledCamera, TiledCameraCfg
+from isaaclab.sensors.camera.tiled_camera import _reshape_tiled_image_cuda
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.timer import Timer
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5, 10])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize(
+    "channels,input_dtype,output_dtype",
+    [(4, np.uint8, np.uint8), (1, np.float32, np.float32), (2, np.float32, np.float32),
+     (3, np.float32, np.float32), (1, np.uint32, np.int32)],
+)
+def test_cuda_atlas_copy_preserves_pixels(count, offset, channels, input_dtype, output_dtype):
+    """GPU copies preserve owned output, padding, alignment and signed segmentation IDs."""
+    height, width = 3, 5
+    columns = int(np.ceil(np.sqrt(count)))
+    rows = int(np.ceil(count / columns))
+    shape = (rows * height, columns * width, channels)
+    pixels = np.arange(np.prod(shape), dtype=np.uint32).reshape(shape)
+    if input_dtype == np.uint32:
+        pixels += np.uint32(2**31)
+    pixels = pixels.astype(input_dtype)
+    if input_dtype == np.float32:
+        pixels = pixels * np.float32(0.125) - np.float32(4.0)
+    # Include trailing padding and exercise byte-misaligned RGBA pointer views.
+    storage = np.concatenate((np.zeros(offset, dtype=input_dtype), pixels.reshape(-1), np.ones(3, dtype=input_dtype)))
+    source_storage = wp.array(storage, device="cuda:0")
+    source = source_storage[offset:]
+    destination_shape = (count, height, width, channels)
+    torch_dtype = torch.from_numpy(np.empty(0, dtype=output_dtype)).dtype
+    destination_storage = torch.full((int(np.prod(destination_shape)) + offset,), 7, dtype=torch_dtype, device="cuda:0")
+    destination = destination_storage[offset:].reshape(destination_shape)
+    destination_ptr = destination.data_ptr()
+    with wp.ScopedStream(wp.Stream("cuda:0")) as stream:
+        _reshape_tiled_image_cuda(source, wp.from_torch(destination), columns)
+        wp.synchronize_stream(stream)
+    actual = destination.cpu().numpy()
+    for camera in range(count):
+        row, column = divmod(camera, columns)
+        expected = pixels[row * height:(row + 1) * height, column * width:(column + 1) * width]
+        np.testing.assert_array_equal(actual[camera], expected.astype(output_dtype))
+    assert destination.data_ptr() == destination_ptr
+    assert destination_ptr != source.ptr
+    if offset:
+        assert destination_storage[0].item() == 7
+    source_storage.zero_()
+    wp.synchronize_device("cuda:0")
+    np.testing.assert_array_equal(destination.cpu().numpy(), actual)
 
 
 @pytest.fixture(scope="function")
@@ -1671,6 +1718,66 @@ def test_frame_offset_large_resolution(setup_camera):
 
     # check difference is above threshold
     assert torch.abs(image_after - image_before).mean() > 0.01  # images of same color should be below 0.001
+
+
+def test_cpu_device_outputs_match_rendered_atlas():
+    """CPU-simulation cameras return this frame's atlas tiles exactly, with contiguous RGB on the host."""
+    stage_utils.create_new_stage()
+    dt = 0.01
+    sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=dt, device="cpu"))
+    try:
+        _populate_scene()
+        stage_utils.update_stage()
+        num_cameras = 5  # 3x2 atlas with a padded tile
+        for i in range(num_cameras):
+            prim_utils.create_prim(f"/World/Origin_{i}", "Xform", translation=(0.3 * i, 0.0, 0.0))
+        camera_cfg = TiledCameraCfg(
+            height=96,
+            width=160,
+            offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 4.0), rot=(0.0, 0.0, 1.0, 0.0), convention="ros"),
+            prim_path="/World/Origin_.*/CameraSensor",
+            update_period=0,
+            data_types=["rgb", "distance_to_camera"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 3.0)
+            ),
+        )
+        camera = TiledCamera(camera_cfg)
+        sim.reset()
+        assert list(camera.data.output.keys()) == ["rgba", "rgb", "distance_to_camera"]
+        for _ in range(5):
+            sim.step()
+        for _ in range(3):
+            sim.step()
+            camera.update(dt)
+            rgba = camera.data.output["rgba"]
+            rgb = camera.data.output["rgb"]
+            distance = camera.data.output["distance_to_camera"]
+            for tensor in (rgba, rgb, distance):
+                assert tensor.device.type == "cpu"
+            assert rgb.is_contiguous()
+            assert rgb.shape == (num_cameras, camera_cfg.height, camera_cfg.width, 3)
+            torch.testing.assert_close(rgb, rgba[..., :3], rtol=0, atol=0)
+            assert rgb.float().mean() > 0.0
+            # Same frame, read back through replicator's host path: tiles must match bit for bit.
+            columns = camera._tiling_grid_shape()[0]
+            atlas_rgba = camera._annotators["rgba"].get_data(device="cpu")
+            atlas_distance = camera._annotators["distance_to_camera"].get_data(device="cpu")
+            atlas_distance = atlas_distance.reshape(*atlas_distance.shape[:2], 1)
+            for index in range(num_cameras):
+                row, column = divmod(index, columns)
+                rows = slice(row * camera_cfg.height, (row + 1) * camera_cfg.height)
+                cols = slice(column * camera_cfg.width, (column + 1) * camera_cfg.width)
+                np.testing.assert_array_equal(rgba[index].numpy(), atlas_rgba[rows, cols])
+                expected = atlas_distance[rows, cols].copy()
+                expected[expected > camera_cfg.spawn.clipping_range[1]] = np.inf
+                np.testing.assert_array_equal(distance[index].numpy(), expected)
+        del camera
+    finally:
+        rep.vp_manager.destroy_hydra_textures("Replicator")
+        sim._timeline.stop()
+        sim.clear_all_callbacks()
+        sim.clear_instance()
 
 
 """
