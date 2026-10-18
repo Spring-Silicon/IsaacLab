@@ -8,10 +8,17 @@
 
 """Launch Isaac Sim Simulator first."""
 
+import os
+
 from isaaclab.app import AppLauncher
 
+# GPU under test (for example cuda:1 on a multi-GPU host) and extra Kit arguments; default: the first GPU.
+DEVICE = os.environ.get("ISAACLAB_TEST_DEVICE", "cuda:0")
+
 # launch omniverse app
-simulation_app = AppLauncher(headless=True, enable_cameras=True).app
+simulation_app = AppLauncher(
+    headless=True, enable_cameras=True, device=DEVICE, kit_args=os.environ.get("ISAACLAB_TEST_KIT_ARGS", "")
+).app
 
 """Rest everything follows."""
 
@@ -62,14 +69,14 @@ def test_cuda_atlas_copy_preserves_pixels(count, offset, channels, input_dtype, 
         pixels = pixels * np.float32(0.125) - np.float32(4.0)
     # Include trailing padding and exercise byte-misaligned RGBA pointer views.
     storage = np.concatenate((np.zeros(offset, dtype=input_dtype), pixels.reshape(-1), np.ones(3, dtype=input_dtype)))
-    source_storage = wp.array(storage, device="cuda:0")
+    source_storage = wp.array(storage, device=DEVICE)
     source = source_storage[offset:]
     destination_shape = (count, height, width, channels)
     torch_dtype = torch.from_numpy(np.empty(0, dtype=output_dtype)).dtype
-    destination_storage = torch.full((int(np.prod(destination_shape)) + offset,), 7, dtype=torch_dtype, device="cuda:0")
+    destination_storage = torch.full((int(np.prod(destination_shape)) + offset,), 7, dtype=torch_dtype, device=DEVICE)
     destination = destination_storage[offset:].reshape(destination_shape)
     destination_ptr = destination.data_ptr()
-    with wp.ScopedStream(wp.Stream("cuda:0")) as stream:
+    with wp.ScopedStream(wp.Stream(DEVICE)) as stream:
         _reshape_tiled_image_cuda(source, wp.from_torch(destination), columns)
         wp.synchronize_stream(stream)
     actual = destination.cpu().numpy()
@@ -82,7 +89,7 @@ def test_cuda_atlas_copy_preserves_pixels(count, offset, channels, input_dtype, 
     if offset:
         assert destination_storage[0].item() == 7
     source_storage.zero_()
-    wp.synchronize_device("cuda:0")
+    wp.synchronize_device(DEVICE)
     np.testing.assert_array_equal(destination.cpu().numpy(), actual)
 
 
@@ -105,7 +112,7 @@ def setup_camera() -> tuple[sim_utils.SimulationContext, TiledCameraCfg, float]:
     # Simulation time-step
     dt = 0.01
     # Load kit helper
-    sim_cfg = sim_utils.SimulationCfg(dt=dt)
+    sim_cfg = sim_utils.SimulationCfg(dt=dt, device=DEVICE)
     sim: sim_utils.SimulationContext = sim_utils.SimulationContext(sim_cfg)
     # populate scene
     _populate_scene()
@@ -166,35 +173,66 @@ def test_single_camera_init(setup_camera):
 
 
 def test_render_product_disabled_has_no_frame(setup_camera):
-    """A disabled render product, or one enabled again without a render since, raises instead of a stale image."""
+    """A disabled render product, or one enabled again without a delivered frame, raises instead of a stale image.
+
+    Renders without stepping deliver the frame after enabling, and it shows the current state: it matches a camera
+    with the same pose that rendered on every step, not the frame read before disabling.
+    """
     sim, camera_cfg, dt = setup_camera
     camera = TiledCamera(camera_cfg)
+    reference_cfg = copy.deepcopy(camera_cfg)
+    reference_cfg.prim_path = "/World/ReferenceCamera"
+    reference = TiledCamera(reference_cfg)
     sim.reset()
     for _ in range(5):
         sim.step()
     camera.update(dt)
     assert camera.render_product_enabled
+    assert not camera.frame_pending
     assert camera.data.output["rgb"].float().mean() > 0.0
+    stale_depth = camera.data.output["distance_to_camera"].clone()
+    frames = camera.frame.clone()
 
     camera.set_render_product_enabled(False)
     assert not camera.render_product_enabled
+    assert not camera.frame_pending
     with pytest.raises(RuntimeError, match="has no frame"):
         camera.data
-    sim.step()
-    camera.update(dt)
-    with pytest.raises(RuntimeError, match="has no frame"):
-        camera.data
+    # The objects fall while the render product is disabled.
+    for _ in range(30):
+        sim.step()
+        camera.update(dt)
+        with pytest.raises(RuntimeError, match="has no frame"):
+            camera.data
     # Eager updates skip the read instead of raising.
     camera.update(dt, force_recompute=True)
 
     camera.set_render_product_enabled(True)
+    assert camera.frame_pending
     with pytest.raises(RuntimeError, match="has no frame"):
         camera.data
     sim.step()
     camera.update(dt)
+    reference.update(dt)
+    renders = 0
+    while camera.frame_pending:
+        with pytest.raises(RuntimeError, match="has no frame"):
+            camera.data
+        assert renders < 10, "no frame delivered within 10 renders after enabling"
+        sim.render()
+        renders += 1
+    camera.update(dt)
+    reference.update(dt)
     assert camera.data.output["rgb"].float().mean() > 0.0
-    assert camera.data.output["distance_to_camera"].mean() > 0.0
-    del camera
+    torch.testing.assert_close(camera.frame, frames + 1)
+    depth = camera.data.output["distance_to_camera"]
+    reference_depth = reference.data.output["distance_to_camera"]
+    assert depth.mean() > 0.0
+    fresh_error = (depth - reference_depth).abs().mean().item()
+    stale_error = (stale_depth - reference_depth).abs().mean().item()
+    assert stale_error > 1.0e-3, "the scene did not change while the render product was disabled"
+    assert fresh_error < 0.2 * stale_error, f"stale frame after enabling: {fresh_error=} {stale_error=} {renders=}"
+    del camera, reference
 
 
 def test_empty_annotator_output_has_no_frame(setup_camera):
@@ -227,7 +265,6 @@ def test_empty_annotator_output_has_no_frame(setup_camera):
     assert camera.data.output["rgb"].float().mean() > 0.0
     torch.testing.assert_close(camera.frame, frames + 1)
     del camera
-
 
 
 def test_depth_clipping_max(setup_camera):

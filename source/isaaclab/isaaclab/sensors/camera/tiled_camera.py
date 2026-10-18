@@ -10,7 +10,7 @@ import math
 import numpy as np
 import torch
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import carb
 import omni.kit.app
@@ -35,6 +35,15 @@ def _is_empty_buffer(buffer: Any) -> bool:
     if isinstance(buffer, wp.array) and buffer.ptr is None:
         return True
     return buffer.size == 0
+
+
+def _empty_outputs(outputs: dict[str, Any]) -> list[str]:
+    """Data types whose annotator output (array, or dict with ``"data"``) holds no frame."""
+    return [
+        data_type
+        for data_type, output in outputs.items()
+        if _is_empty_buffer(output["data"] if isinstance(output, dict) else output)
+    ]
 
 
 def _reshape_tiled_image_cuda(
@@ -124,6 +133,11 @@ class TiledCamera(Camera):
     cfg: TiledCameraCfg
     """The configuration parameters."""
 
+    TOGGLEABLE_DATA_TYPES: ClassVar[frozenset[str]] = frozenset({"rgb", "rgba", "distance_to_camera"})
+    """Data types whose annotators deliver frames of the current state after the render product is enabled again
+    (see :meth:`set_render_product_enabled`). With every annotator on ten tiled cameras, a depth output was wrong
+    when the annotators were attached for toggling, so other data types are not supported."""
+
     def __init__(self, cfg: TiledCameraCfg):
         """Initializes the tiled camera sensor.
 
@@ -144,6 +158,8 @@ class TiledCamera(Camera):
         # render product update state (see :meth:`set_render_product_enabled`)
         self._render_product_enabled = True
         self._enabled_at_update: int | None = None
+        # Whether the annotators were attached for render product toggling (see set_render_product_enabled).
+        self._toggle_ready = False
         self._skip_eager_read = False
         super().__init__(cfg)
 
@@ -192,6 +208,15 @@ class TiledCamera(Camera):
         """Whether the renderer updates this camera's render product on each render (default True)."""
         return self._render_product_enabled
 
+    @property
+    def frame_pending(self) -> bool:
+        """Whether the render product is enabled, but its annotators have not delivered a frame since enabling.
+
+        While a frame is pending, reading the image data raises :class:`RuntimeError`. Renders without stepping
+        the simulation deliver it (see :meth:`set_render_product_enabled`).
+        """
+        return self._render_product_enabled and not self._frame_available()
+
     def set_render_product_enabled(self, enabled: bool):
         """Enable or disable the renderer updates of this camera's render product.
 
@@ -199,26 +224,47 @@ class TiledCamera(Camera):
         of the stage still render. It also has no frame while it is disabled: until it is enabled again and the
         annotators deliver a frame of a later render (Kit app update), reading the image data raises
         :class:`RuntimeError` instead of returning an earlier frame. The first delivered frame can need more than
-        one render after enabling. RTX real-time rendering keeps per-render-product temporal history, so the first
-        frames after enabling differ slightly from the frames of a render product that updated on every render.
+        one render after enabling (:attr:`frame_pending` stays True until then). To read a frame of the current
+        simulation state, render again without stepping until no frame is pending, as
+        :meth:`~isaaclab.envs.ManagerBasedRLEnv.step` does for the camera groups it computes. RTX real-time
+        rendering keeps per-render-product temporal history, so the first frames after enabling differ slightly
+        from the frames of a render product that updated on every render.
 
         Args:
             enabled: Whether to update the render product on renders.
 
         Raises:
             RuntimeError: If the camera is not initialized.
+            ValueError: If the camera has data types whose render product toggling is not supported.
         """
         if not self._is_initialized:
             raise RuntimeError(f"Camera '{self.cfg.prim_path}' is not initialized: it has no render product yet.")
         enabled = bool(enabled)
         if enabled == self._render_product_enabled:
             return
+        if not self._toggle_ready:
+            unsupported = sorted(set(self.cfg.data_types) - self.TOGGLEABLE_DATA_TYPES)
+            if unsupported:
+                raise ValueError(
+                    f"Camera '{self.cfg.prim_path}' cannot disable its render product with the data types"
+                    f" {unsupported}: only {sorted(self.TOGGLEABLE_DATA_TYPES)} deliver correct frames after enabling."
+                )
+            # Annotators attached while the render product updates are enabled deliver no frames once the updates
+            # are disabled and enabled again. Attach them again with updates disabled, as replicator intends for
+            # toggled render products (once, on the first toggle; cameras that never toggle are unchanged).
+            for annotator in self._annotators.values():
+                annotator.detach()
+            self._render_product.hydra_texture.set_updates_enabled(False)
+            for annotator in self._annotators.values():
+                annotator.attach(self._render_product_paths)
+            self._toggle_ready = True
         self._render_product.hydra_texture.set_updates_enabled(enabled)
         self._render_product_enabled = enabled
         if not enabled:
             # The data read for an earlier step is outdated now: reads raise until a frame exists again.
             self._outdated_hint = True
-        # Kit update after which a frame rendered with updates enabled exists (None: one exists already).
+        # Kit update after which the annotators can deliver a frame rendered with updates enabled
+        # (None: they hold one already).
         self._enabled_at_update = omni.kit.app.get_app().get_update_number() if enabled else None
 
     def update(self, dt: float, force_recompute: bool = False):
@@ -351,23 +397,16 @@ class TiledCamera(Camera):
     def _update_buffers_impl(self, env_ids: Sequence[int]):
         if not self._frame_available():
             raise RuntimeError(
-                f"Camera '{self.cfg.prim_path}' has no frame for this step: its render product is disabled, or no"
-                " render ran since it was enabled (see set_render_product_enabled)."
+                f"Camera '{self.cfg.prim_path}' has no frame for this step: its render product is disabled, or its"
+                " annotators delivered no frame since it was enabled (see set_render_product_enabled)."
             )
-        # Fetch every annotator output before any buffer changes. After a render product is enabled again,
-        # the renderer can need more than one render before the annotators deliver a frame; until then the
-        # outputs are empty (no device pointer). The read raises and the data stays outdated, so the camera
-        # never returns an earlier frame and never copies from a null buffer.
+        # Fetch every annotator output before any buffer changes. An empty output (no device pointer) raises and
+        # the data stays outdated, so the camera never returns an earlier frame and never copies from a null buffer.
         outputs = {data_type: annotator.get_data() for data_type, annotator in self._annotators.items()}
-        empty = [
-            data_type
-            for data_type, output in outputs.items()
-            if _is_empty_buffer(output["data"] if isinstance(output, dict) else output)
-        ]
+        empty = _empty_outputs(outputs)
         if empty:
             raise RuntimeError(
-                f"Camera '{self.cfg.prim_path}' has no frame for this step: the annotators {empty} returned no"
-                " data (render product enabled again without a delivered frame yet, see set_render_product_enabled)."
+                f"Camera '{self.cfg.prim_path}' has no frame for this step: the annotators {empty} returned no data."
             )
         self._read_annotators(env_ids, outputs)
 
@@ -376,7 +415,12 @@ class TiledCamera(Camera):
         if not self._render_product_enabled:
             return False
         if self._enabled_at_update is not None:
+            # Enabled again: no frame before a later render, and none until every annotator delivers one. After
+            # enabling, the renderer can need more than one render before the annotators deliver a frame; until
+            # then their outputs are empty.
             if omni.kit.app.get_app().get_update_number() <= self._enabled_at_update:
+                return False
+            if _empty_outputs({data_type: annotator.get_data() for data_type, annotator in self._annotators.items()}):
                 return False
             self._enabled_at_update = None
         return True

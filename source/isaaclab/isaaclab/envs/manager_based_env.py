@@ -5,8 +5,8 @@
 
 import builtins
 import torch
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Collection, Sequence
+from typing import Any, ClassVar
 
 import isaacsim.core.utils.torch as torch_utils
 import omni.log
@@ -66,6 +66,10 @@ class ManagerBasedEnv:
     environment time-step is computed as the product of the two. The two time-steps can be obtained by
     querying the :attr:`physics_dt` and the :attr:`step_dt` properties respectively.
     """
+
+    max_frame_delivery_renders: ClassVar[int] = 10
+    """Extra renders after which a camera enabled again without a delivered frame raises (see
+    :meth:`~isaaclab.sensors.TiledCamera.set_render_product_enabled`)."""
 
     def __init__(self, cfg: ManagerBasedEnvCfg):
         """Initialize the environment.
@@ -309,6 +313,7 @@ class ManagerBasedEnv:
         # if sensors are added to the scene, make sure we render to reflect changes in reset
         if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
             self.sim.render()
+            self._render_pending_camera_frames()
 
         # trigger recorder terms for post-reset calls
         self.recorder_manager.record_post_reset(env_ids)
@@ -369,6 +374,7 @@ class ManagerBasedEnv:
         # if sensors are added to the scene, make sure we render to reflect changes in reset
         if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
             self.sim.render()
+            self._render_pending_camera_frames()
 
         # trigger recorder terms for post-reset calls
         self.recorder_manager.record_post_reset(env_ids)
@@ -419,6 +425,8 @@ class ManagerBasedEnv:
                 self.sim.render()
             # update buffers at sim dt
             self.scene.update(dt=self.physics_dt)
+        if is_rendering:
+            self._render_pending_camera_frames()
 
         # post-step: step interval event
         if "interval" in self.event_manager.available_modes:
@@ -430,6 +438,43 @@ class ManagerBasedEnv:
 
         # return observations and extras
         return self.obs_buf, self.extras
+
+    def _render_pending_camera_frames(self, skip_groups: Collection[str] = ()):
+        """Render without stepping the simulation until the cameras of the computed camera groups have a frame.
+
+        A camera whose render product was enabled again (see
+        :meth:`~isaaclab.sensors.TiledCamera.set_render_product_enabled`) can need more than one render before its
+        annotators deliver a frame (:attr:`~isaaclab.sensors.TiledCamera.frame_pending`). The extra renders show the
+        current simulation state, so the observations read afterwards are of this state. Other cameras need none.
+
+        Args:
+            skip_groups: Camera observation groups that are not computed; their cameras are not waited for.
+
+        Raises:
+            RuntimeError: If a camera delivers no frame within :attr:`max_frame_delivery_renders` extra renders.
+        """
+        from isaaclab.sensors import TiledCamera
+
+        sensors = self.scene.sensors
+        names = dict.fromkeys(
+            name
+            for group, group_names in self.observation_manager.camera_group_sensors.items()
+            if group not in skip_groups
+            for name in group_names
+        )
+        pending = [
+            sensors[name] for name in names if isinstance(sensors[name], TiledCamera) and sensors[name].frame_pending
+        ]
+        for _ in range(self.max_frame_delivery_renders):
+            if not pending:
+                return
+            self.sim.render()
+            pending = [sensor for sensor in pending if sensor.frame_pending]
+        if pending:
+            raise RuntimeError(
+                f"Cameras {[sensor.cfg.prim_path for sensor in pending]} delivered no frame within"
+                f" {self.max_frame_delivery_renders} renders after their render products were enabled."
+            )
 
     @staticmethod
     def seed(seed: int = -1) -> int:

@@ -178,8 +178,13 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
           :meth:`~isaaclab.sensors.TiledCamera.set_render_product_enabled`).
         * ``render=False`` additionally skips rendering (including the re-render after resets) for this step.
 
+        A camera whose render product was enabled again (see
+        :meth:`~isaaclab.sensors.TiledCamera.set_render_product_enabled`) can need more than one render before its
+        annotators deliver a frame. When a computed camera group reads such a camera, the step renders again
+        without stepping the simulation until the frame is delivered, so the group observes this step's state.
+
         Physics, scene updates, terminations, rewards, recorders, resets and all other observation groups are
-        unaffected by both options.
+        unaffected by these options.
 
         Args:
             action: The actions to apply on the environment. Shape is (num_envs, action_dim).
@@ -192,6 +197,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
 
         Raises:
             ValueError: If camera observations are requested without rendering.
+            RuntimeError: If a camera of a computed camera group delivers no frame within
+                :attr:`max_frame_delivery_renders` extra renders.
         """
         if isinstance(camera_observations, bool):
             skip_groups = () if camera_observations else self.observation_manager.camera_groups
@@ -231,6 +238,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
                 self.sim.render()
             # update buffers at sim dt
             self.scene.update(dt=self.physics_dt)
+        if is_rendering and computes_camera_groups:
+            self._render_pending_camera_frames(skip_groups)
 
         # post-step:
         # -- update env counters (used for curriculum generation)
@@ -273,6 +282,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
             # if sensors are added to the scene, make sure we render to reflect changes in reset
             if render and self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
                 self.sim.render()
+                if computes_camera_groups:
+                    self._render_pending_camera_frames(skip_groups)
 
             # trigger recorder terms for post-reset calls
             self.recorder_manager.record_post_reset(reset_env_ids)
